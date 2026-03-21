@@ -1,283 +1,171 @@
 /**
- * db.js — Database layer
- * Uses SQLite (via better-sqlite3) for local dev.
- * To use Postgres in production, swap the queries to pg — the interface stays identical.
+ * db.js — Simple JSON file database
+ * No compilation needed, works everywhere
  */
 
-const Database = require("better-sqlite3");
+const fs = require("fs");
 const path = require("path");
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "reachbot.db");
-const db = new Database(DB_PATH);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ─── Schema ───────────────────────────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT UNIQUE NOT NULL,
-    name TEXT,
-    email TEXT,
-    source TEXT DEFAULT 'manual',
-    status TEXT DEFAULT 'new',
-    optOut INTEGER DEFAULT 0,
-    lastReply TEXT,
-    lastReplyAt TEXT,
-    createdAt TEXT DEFAULT (datetime('now')),
-    updatedAt TEXT DEFAULT (datetime('now'))
-  );
+function readFile(name) {
+  const file = path.join(DATA_DIR, `${name}.json`);
+  if (!fs.existsSync(file)) return [];
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return []; }
+}
 
-  CREATE TABLE IF NOT EXISTS follow_up_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT NOT NULL,
-    step INTEGER NOT NULL,
-    scheduledAt TEXT NOT NULL,
-    sentAt TEXT,
-    status TEXT DEFAULT 'pending',
-    message TEXT
-  );
+function writeFile(name, data) {
+  const file = path.join(DATA_DIR, `${name}.json`);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
 
-  CREATE TABLE IF NOT EXISTS activity_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL,
-    phone TEXT,
-    message TEXT,
-    status TEXT,
-    createdAt TEXT DEFAULT (datetime('now'))
-  );
+function readConfig() {
+  const file = path.join(DATA_DIR, "config.json");
+  if (!fs.existsSync(file)) return {};
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
+}
 
-  CREATE TABLE IF NOT EXISTS sent_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT NOT NULL,
-    type TEXT NOT NULL,
-    sentAt TEXT DEFAULT (datetime('now'))
-  );
+function writeConfig(data) {
+  const file = path.join(DATA_DIR, "config.json");
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
 
-  CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
-`);
-
-// ─── Leads ────────────────────────────────────────────────────────────────────
+// ── Leads ──────────────────────────────────────────────────────────────────────
 function upsertLead(data) {
-  const existing = db
-    .prepare("SELECT * FROM leads WHERE phone = ?")
-    .get(data.phone);
-
-  if (existing) {
-    db.prepare(`
-      UPDATE leads SET
-        name = COALESCE(?, name),
-        email = COALESCE(?, email),
-        source = COALESCE(?, source),
-        status = COALESCE(?, status),
-        updatedAt = datetime('now')
-      WHERE phone = ?
-    `).run(data.name, data.email, data.source, data.status, data.phone);
-    return db.prepare("SELECT * FROM leads WHERE phone = ?").get(data.phone);
-  } else {
-    db.prepare(`
-      INSERT INTO leads (phone, name, email, source, status)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      data.phone,
-      data.name || null,
-      data.email || null,
-      data.source || "manual",
-      data.status || "new"
-    );
-    return db.prepare("SELECT * FROM leads WHERE phone = ?").get(data.phone);
+  const leads = readFile("leads");
+  const idx = leads.findIndex(l => l.phone === data.phone);
+  const now = new Date().toISOString();
+  if (idx >= 0) {
+    leads[idx] = { ...leads[idx], ...data, updatedAt: now };
+    writeFile("leads", leads);
+    return leads[idx];
   }
+  const lead = { id: Date.now(), ...data, createdAt: now, updatedAt: now };
+  leads.push(lead);
+  writeFile("leads", leads);
+  return lead;
 }
 
 function getLead(phone) {
-  return db.prepare("SELECT * FROM leads WHERE phone = ?").get(phone) || null;
+  return readFile("leads").find(l => l.phone === phone) || null;
 }
 
 function getAllLeads() {
-  return db.prepare("SELECT * FROM leads ORDER BY createdAt DESC").all();
+  return readFile("leads").sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 function updateLead(phone, updates) {
-  const fields = Object.keys(updates)
-    .map((k) => `${k} = ?`)
-    .join(", ");
-  const values = [...Object.values(updates), phone];
-  db.prepare(`UPDATE leads SET ${fields}, updatedAt = datetime('now') WHERE phone = ?`).run(
-    ...values
-  );
+  const leads = readFile("leads");
+  const idx = leads.findIndex(l => l.phone === phone);
+  if (idx >= 0) {
+    leads[idx] = { ...leads[idx], ...updates, updatedAt: new Date().toISOString() };
+    writeFile("leads", leads);
+  }
 }
 
-// ─── Follow-up Queue ──────────────────────────────────────────────────────────
+// ── Follow-up Queue ────────────────────────────────────────────────────────────
 function queueFollowUp(phone, step, scheduledAt, message) {
-  db.prepare(`
-    INSERT INTO follow_up_queue (phone, step, scheduledAt, message)
-    VALUES (?, ?, ?, ?)
-  `).run(phone, step, scheduledAt.toISOString(), message);
+  const queue = readFile("followup_queue");
+  queue.push({ id: Date.now() + Math.random(), phone, step, scheduledAt: scheduledAt.toISOString(), message, status: "pending" });
+  writeFile("followup_queue", queue);
 }
 
 function getPendingFollowUps() {
-  return db
-    .prepare(`
-      SELECT * FROM follow_up_queue
-      WHERE status = 'pending'
-      AND scheduledAt <= datetime('now')
-    `)
-    .all();
+  const now = new Date().toISOString();
+  return readFile("followup_queue").filter(i => i.status === "pending" && i.scheduledAt <= now);
 }
 
 function markFollowUpSent(id) {
-  db.prepare(`
-    UPDATE follow_up_queue
-    SET status = 'sent', sentAt = datetime('now')
-    WHERE id = ?
-  `).run(id);
+  const queue = readFile("followup_queue");
+  const idx = queue.findIndex(i => i.id === id);
+  if (idx >= 0) { queue[idx].status = "sent"; queue[idx].sentAt = new Date().toISOString(); writeFile("followup_queue", queue); }
 }
 
 function cancelFollowUps(phone) {
-  db.prepare(`
-    UPDATE follow_up_queue
-    SET status = 'cancelled'
-    WHERE phone = ? AND status = 'pending'
-  `).run(phone);
+  const queue = readFile("followup_queue");
+  queue.forEach(i => { if (i.phone === phone && i.status === "pending") i.status = "cancelled"; });
+  writeFile("followup_queue", queue);
 }
 
-function getFollowUpStepCount(phone) {
-  const row = db
-    .prepare(`SELECT COUNT(*) as cnt FROM follow_up_queue WHERE phone = ? AND status = 'sent'`)
-    .get(phone);
-  return row?.cnt || 0;
-}
-
-// ─── Activity Log ─────────────────────────────────────────────────────────────
+// ── Activity Log ───────────────────────────────────────────────────────────────
 function logActivity({ type, phone, message, status }) {
-  db.prepare(`
-    INSERT INTO activity_log (type, phone, message, status)
-    VALUES (?, ?, ?, ?)
-  `).run(type, phone || null, message || null, status || null);
+  const log = readFile("activity_log");
+  log.unshift({ id: Date.now(), type, phone, message, status, createdAt: new Date().toISOString() });
+  if (log.length > 500) log.splice(500);
+  writeFile("activity_log", log);
 }
 
 function getRecentActivity(limit = 50) {
-  return db
-    .prepare("SELECT * FROM activity_log ORDER BY createdAt DESC LIMIT ?")
-    .all(limit);
+  return readFile("activity_log").slice(0, limit);
 }
 
-// ─── Sent Log (dedup) ─────────────────────────────────────────────────────────
+// ── Sent Log ───────────────────────────────────────────────────────────────────
 function wasRecentlySent(phone, type, withinHours = 24) {
-  const row = db
-    .prepare(`
-      SELECT * FROM sent_log
-      WHERE phone = ? AND type = ?
-      AND sentAt >= datetime('now', '-${withinHours} hours')
-    `)
-    .get(phone, type);
-  return !!row;
+  const log = readFile("sent_log");
+  const cutoff = new Date(Date.now() - withinHours * 3600 * 1000).toISOString();
+  return log.some(i => i.phone === phone && i.type === type && i.sentAt >= cutoff);
 }
 
 function recordSent(phone, type) {
-  db.prepare("INSERT INTO sent_log (phone, type) VALUES (?, ?)").run(phone, type);
+  const log = readFile("sent_log");
+  log.push({ phone, type, sentAt: new Date().toISOString() });
+  if (log.length > 1000) log.splice(0, log.length - 1000);
+  writeFile("sent_log", log);
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ── Config ─────────────────────────────────────────────────────────────────────
 const DEFAULT_CONFIG = {
   businessName: "My Business",
   ownerPhone: "",
   bookingUrl: "",
   services: "",
   pricing: "",
-  hours: "Mon–Sat 7am–6pm",
+  hours: "Mon-Sat 7am-6pm",
   openHour: 7,
   closeHour: 18,
-  workDays: [1, 2, 3, 4, 5, 6],
+  workDays: [1,2,3,4,5,6],
   afterHoursOnly: false,
   skipRepeatCallers: true,
   followUpEnabled: true,
   aiEnabled: true,
-  missedCallTemplate:
-    "Hey! Sorry we missed your call at {business_name}. We'll get back to you ASAP — or reply here to chat now.{booking_line}",
+  missedCallTemplate: "Hey! Sorry we missed your call at {business_name}. We'll get back to you ASAP - or reply here to chat now.{booking_line}",
   followUpSteps: [
-    {
-      delay: 0,
-      message:
-        "Hey {first_name}, this is {business_name}! You recently reached out — still interested? Reply YES or call us back.",
-    },
-    {
-      delay: 24 * 60,
-      message:
-        "Just checking in, {first_name} — we'd love to help. Any questions? Reply anytime.{booking_line}",
-    },
-    {
-      delay: 3 * 24 * 60,
-      message:
-        "Hi {first_name} — we're running a special this week. Want me to hold a spot for you? Just reply and we'll take care of everything.",
-    },
-    {
-      delay: 7 * 24 * 60,
-      message:
-        "Last message from us, {first_name}. If now's not the right time, no worries! Just save our number — we're here when you need us.",
-    },
+    { delay: 0, message: "Hey {first_name}, this is {business_name}! You recently reached out - still interested? Reply YES or call us back." },
+    { delay: 1440, message: "Just checking in, {first_name} - we'd love to help. Any questions? Reply anytime.{booking_line}" },
+    { delay: 4320, message: "Hi {first_name} - we're running a special this week. Want me to hold a spot for you? Just reply!" },
+    { delay: 10080, message: "Last message from us, {first_name}. No worries if now's not the right time - just save our number for when you need us." }
   ],
-  qaKnowledge: [],
+  qaKnowledge: []
 };
 
 function getConfig() {
-  const rows = db.prepare("SELECT key, value FROM config").all();
-  const stored = {};
-  rows.forEach((r) => {
-    try {
-      stored[r.key] = JSON.parse(r.value);
-    } catch {
-      stored[r.key] = r.value;
-    }
-  });
-  return { ...DEFAULT_CONFIG, ...stored };
+  return { ...DEFAULT_CONFIG, ...readConfig() };
 }
 
 function saveConfig(updates) {
-  const stmt = db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)");
-  const saveMany = db.transaction((obj) => {
-    for (const [key, value] of Object.entries(obj)) {
-      stmt.run(key, JSON.stringify(value));
-    }
-  });
-  saveMany(updates);
+  const current = readConfig();
+  writeConfig({ ...current, ...updates });
 }
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
+// ── Stats ──────────────────────────────────────────────────────────────────────
 function getStats() {
-  const missedCallsSent = db
-    .prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE type = 'missed-call'")
-    .get().cnt;
-  const followUpsSent = db
-    .prepare("SELECT COUNT(*) as cnt FROM follow_up_queue WHERE status = 'sent'")
-    .get().cnt;
-  const aiReplies = db
-    .prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE type = 'ai-reply'")
-    .get().cnt;
-  const converted = db
-    .prepare("SELECT COUNT(*) as cnt FROM leads WHERE status = 'converted'")
-    .get().cnt;
-  const totalLeads = db.prepare("SELECT COUNT(*) as cnt FROM leads").get().cnt;
-
-  return { missedCallsSent, followUpsSent, aiReplies, converted, totalLeads };
+  const log = readFile("activity_log");
+  const leads = readFile("leads");
+  const queue = readFile("followup_queue");
+  return {
+    missedCallsSent: log.filter(i => i.type === "missed-call").length,
+    followUpsSent: queue.filter(i => i.status === "sent").length,
+    aiReplies: log.filter(i => i.type === "ai-reply").length,
+    converted: leads.filter(l => l.status === "converted").length,
+    totalLeads: leads.length
+  };
 }
 
 module.exports = {
-  upsertLead,
-  getLead,
-  getAllLeads,
-  updateLead,
-  queueFollowUp,
-  getPendingFollowUps,
-  markFollowUpSent,
-  cancelFollowUps,
-  getFollowUpStepCount,
-  logActivity,
-  getRecentActivity,
-  wasRecentlySent,
-  recordSent,
-  getConfig,
-  saveConfig,
-  getStats,
+  upsertLead, getLead, getAllLeads, updateLead,
+  queueFollowUp, getPendingFollowUps, markFollowUpSent, cancelFollowUps,
+  logActivity, getRecentActivity,
+  wasRecentlySent, recordSent,
+  getConfig, saveConfig, getStats
 };

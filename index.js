@@ -26,7 +26,26 @@ const { scheduleFollowUps } = require("./scheduler");
 const registerAiTest = require("./routes/ai-test");
 
 const app = express();
-app.use(cors());
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,
+  "http://localhost:3000",
+  "http://localhost:5173",
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    if (process.env.NODE_ENV !== "production") return callback(null, true);
+    callback(new Error("CORS blocked: " + origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+}));
+
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -232,9 +251,100 @@ function isWithinBusinessHours(config) {
 // ─── AI Test Route ────────────────────────────────────────────────────────────
 registerAiTest(app);
 
+// ─── Health Check ─────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    webhooks: {
+      missedCall: (process.env.PUBLIC_URL || "") + "/webhook/missed-call",
+      inboundSms: (process.env.PUBLIC_URL || "") + "/webhook/inbound-sms",
+    },
+  });
+});
+
+// ─── Onboard new client ───────────────────────────────────────────────────────
+// Called by the onboarding form when a new client completes setup
+app.post("/api/onboard", async (req, res) => {
+  try {
+    const {
+      plan, businessName, email, ownerPhone, industry,
+      services, pricing, bookingUrl, hours,
+      missedCallTemplate, afterHoursOnly, skipRepeatCallers,
+      openHour, closeHour, workDays,
+      followUpSteps, qaKnowledge,
+    } = req.body;
+
+    if (!businessName) return res.status(400).json({ error: "businessName is required" });
+
+    // Save client record
+    const stmt = db.upsertLead({
+      phone: ownerPhone || "unknown",
+      name: businessName,
+      email: email || null,
+      source: "onboarding",
+      status: "active",
+    });
+
+    // Save their full config
+    await db.saveConfig({
+      businessName, ownerPhone, services, pricing,
+      bookingUrl, hours, missedCallTemplate,
+      afterHoursOnly: afterHoursOnly || false,
+      skipRepeatCallers: skipRepeatCallers !== false,
+      openHour: openHour || 7,
+      closeHour: closeHour || 18,
+      workDays: workDays || [1,2,3,4,5,6],
+      followUpSteps: followUpSteps || [],
+      qaKnowledge: qaKnowledge || [],
+    });
+
+    // Text the business owner welcoming them
+    if (ownerPhone) {
+      await sendSMS(
+        ownerPhone,
+        `Welcome to ReachBot! Your ${plan || "Growth"} plan is now active for ${businessName}. Your AI automation is live — we'll text you when your first lead comes in!`
+      );
+    }
+
+    // Text you so you know a new client signed up
+    if (process.env.OWNER_PHONE && process.env.OWNER_PHONE !== ownerPhone) {
+      await sendSMS(
+        process.env.OWNER_PHONE,
+        `New ReachBot signup: ${businessName} (${plan} plan). Phone: ${ownerPhone}. Industry: ${industry || "unknown"}.`
+      );
+    }
+
+    const publicUrl = process.env.PUBLIC_URL || "https://your-server.up.railway.app";
+    res.json({
+      success: true,
+      message: "Client configured and activated",
+      webhookVoice: `${publicUrl}/webhook/missed-call",
+      webhookSms: `${publicUrl}/webhook/inbound-sms`,
+      nextStep: "Paste the webhook URLs into your Twilio phone number settings",
+    });
+
+  } catch (err) {
+    console.error("Onboard error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── List clients (agency dashboard) ─────────────────────────────────────────
+app.get("/api/clients", async (req, res) => {
+  try {
+    const leads = await db.getAllLeads();
+    const clients = leads.filter(l => l.source === "onboarding" || l.source === "manual");
+    res.json(clients);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🤖 ReachBot server running on port ${PORT}`);
   console.log(`   Missed call webhook: POST /webhook/missed-call`);
   console.log(`   Inbound SMS webhook: POST /webhook/inbound-sms`);
